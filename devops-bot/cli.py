@@ -10,8 +10,8 @@ from flask import Flask
 from cryptography.fernet import Fernet
 from botocore.exceptions import NoCredentialsError, PartialCredentialsError, ClientError
 from datetime import datetime
-
-
+from tabulate import tabulate
+from getpass import getpass
 
 cli = click.Group()
 
@@ -83,18 +83,7 @@ def check_bucket_exists(bucket_name):
     except ClientError:
         return False
 
-def list_versions_in_bucket():
-    try:
-        credentials = load_aws_credentials()
-        s3 = boto3.client('s3', **credentials)
-        response = s3.list_objects_v2(Bucket=VERSION_BUCKET_NAME)
-        return response.get('Contents', [])
-    except ClientError:
-        return []
 
-def list_versions_locally():
-    ensure_version_folder()
-    return [f for f in os.listdir(VERSION_DIR) if f.endswith('.enc')]
 
 
 
@@ -269,50 +258,8 @@ def save_version_info_to_bucket(version_id, comment, content):
 
 
 
-def load_version_info(version_id):
-    key = load_key()
-    if os.path.exists(os.path.join(VERSION_DIR, f"{version_id}.enc")):
-        with open(os.path.join(VERSION_DIR, f"{version_id}.enc"), 'rb') as version_file:
-            encrypted_version_info = version_file.read()
-        decrypted_version_info = decrypt_data(encrypted_version_info, key)
-        return json.loads(decrypted_version_info)
-    else:
-        try:
-            credentials = load_aws_credentials()
-            s3 = boto3.client('s3', **credentials)
-            response = s3.get_object(Bucket=VERSION_BUCKET_NAME, Key=f"{version_id}.enc")
-            encrypted_version_info = response['Body'].read()
-            decrypted_version_info = decrypt_data(encrypted_version_info, key)
-            return json.loads(decrypted_version_info)
-        except ClientError as e:
-            click.echo(click.style(f"No version information found for ID {version_id}.", fg="red"))
-            return None
-def create_ec2_instances(instance_type, ami_id, key_name, security_group, count, tags):
-    credentials = load_aws_credentials()
-    if not credentials:
-        click.echo("No AWS credentials found. Please configure them first.")
-        return None
 
-    ec2 = boto3.client('ec2', **credentials)
-    try:
-        instances = ec2.run_instances(
-            ImageId=ami_id,
-            InstanceType=instance_type,
-            KeyName=key_name,
-            SecurityGroupIds=[security_group],
-            MinCount=count,
-            MaxCount=count,
-            TagSpecifications=[
-                {
-                    'ResourceType': 'instance',
-                    'Tags': [{'Key': k, 'Value': v} for k, v in tags.items()]
-                }
-            ]
-        )
-        return instances['Instances']
-    except ClientError as e:
-        click.echo(click.style(f"Failed to create instances: {e}", fg="red"))
-        return None
+
 
 @cli.command(name="create-ec2", help="Create EC2 instances with specified options.")
 @click.option('--instance-type', required=True, help="EC2 instance type")
@@ -424,22 +371,203 @@ def create_version_bucket():
     except ClientError as e:
         click.echo(click.style(f"Failed to create S3 bucket: {e}", fg="red"))
 
+#deleate instance
 
-@cli.command(name="view-version", help="View version information.")
-def view_version():
-    versions = list_versions_locally() + list_versions_in_bucket()
-    if not versions:
+@cli.command(name="delete-ec2", help="Delete EC2 instances using instance IDs or a version ID.")
+@click.argument('ids', nargs=-1)
+@click.option('--version-id', help="Version ID to delete instances from")
+def delete_ec2(ids, version_id):
+    instance_ids = list(ids)
+
+    if version_id:
+        version_info = load_version_info(version_id)
+        if not version_info:
+            click.echo("No version information found.")
+            return
+        instance_ids.extend(instance['InstanceId'] for instance in version_info['content'])
+
+    if not instance_ids:
+        click.echo("No instance IDs provided.")
+        return
+
+    click.echo(click.style(f"\nStaging area: Deleting EC2 instance(s) with IDs:", fg="red"))
+    for idx, instance_id in enumerate(instance_ids):
+        click.echo(click.style(f"  Instance {idx+1}: ID = {instance_id}", fg="red"))
+
+    if click.confirm(click.style("Do you want to proceed with deleting the instance(s)?", fg="red"), default=False):
+        comment = click.prompt(click.style("Enter a comment for this version", fg="red"))
+        version_id = str(uuid.uuid4())  # Generate a unique version ID
+
+        try:
+            terminated_instances = delete_ec2_instances(instance_ids)
+            if terminated_instances is None:
+                raise Exception("Instance deletion failed. Aborting operation.")
+
+            click.echo(click.style("Instances deleted successfully.", fg="green"))
+            for idx, instance in enumerate(terminated_instances):
+                click.echo(click.style(f"Instance {idx+1}: ID = {instance['InstanceId']} - {instance['CurrentState']['Name']}", fg="green"))
+
+            version_content = [{'InstanceId': instance['InstanceId'], 'CurrentState': instance['CurrentState']} for instance in terminated_instances]
+            
+            if check_bucket_exists(VERSION_BUCKET_NAME):
+                save_version_info_to_bucket(version_id, comment, version_content)
+            else:
+                if click.confirm("Do you want to save the version information in a bucket?", default=False):
+                    create_version_bucket()
+                    save_version_info_to_bucket(version_id, comment, version_content)
+                else:
+                    save_version_info_locally(version_id, comment, version_content)
+        except Exception as e:
+            click.echo(click.style(f"Failed to delete instances: {e}", fg="red"))
+    else:
+        click.echo(click.style("Instance deletion aborted.", fg="yellow"))
+
+# Utility function for deleting EC2 instances
+
+def delete_ec2_instances(instance_ids):
+    credentials = load_aws_credentials()
+    if not credentials:
+        click.echo("No AWS credentials found. Please configure them first.")
+        return None
+
+    ec2 = boto3.client('ec2', **credentials)
+    try:
+        response = ec2.terminate_instances(InstanceIds=instance_ids)
+        return response['TerminatingInstances']
+    except ClientError as e:
+        click.echo(click.style(f"Failed to delete instances: {e}", fg="red"))
+        return None
+
+
+
+#recreat
+
+@cli.command(name="recreate-ec2", help="Recreate EC2 instances using a version ID.")
+@click.option('--version-id', required=True, help="Version ID to recreate instances from")
+def recreate_ec2(version_id):
+    version_info = load_version_info(version_id)
+    if not version_info:
         click.echo("No version information found.")
         return
     
-    for version in versions:
-        version_id = version['Key'].split('.enc')[0] if 'Key' in version else version.split('.enc')[0]
-        version_info = load_version_info(version_id)
-        if version_info:
-            click.echo(click.style(f"Version ID: {version_info['version_id']}", fg="green"))
-            click.echo(click.style(f"Comment: {version_info['comment']}", fg="green"))
+    instances_to_recreate = version_info['content']
+    
+    click.echo(click.style(f"\nStaging area: Recreating EC2 instance(s):", fg="green"))
+    for idx, instance in enumerate(instances_to_recreate):
+        click.echo(click.style(f"  Instance {idx+1}:", fg="green"))
+        click.echo(click.style(f"    Instance Type: {instance['InstanceType']}", fg="green"))
+        click.echo(click.style(f"    AMI ID: {instance['ImageId']}", fg="green"))
+        click.echo(click.style(f"    Key Name: {instance['KeyName']}", fg="green"))
+        security_groups = instance.get('SecurityGroups', [])
+        security_group_ids = [sg['GroupId'] for sg in security_groups] if security_groups else None
+        click.echo(click.style(f"    Security Group: {security_group_ids if security_group_ids else 'None'}", fg="green"))
+        click.echo(click.style(f"    Tags: {instance['Tags']}", fg="green"))
+    
+    if click.confirm(click.style("Do you want to proceed with recreating the instance(s)?", fg="green"), default=True):
+        new_version_id = str(uuid.uuid4())
+        comment = click.prompt(click.style("Enter a new comment for this version", fg="green"))
+
+        try:
+            recreated_instances = []
+            for instance in instances_to_recreate:
+                created_instances = create_ec2_instances(
+                    instance_type=instance['InstanceType'],
+                    ami_id=instance['ImageId'],
+                    key_name=instance['KeyName'],
+                    security_group=security_group_ids[0] if security_group_ids else None,
+                    count=1,
+                    tags={tag['Key']: tag['Value'] for tag in instance['Tags']}
+                )
+                if created_instances is None:
+                    raise Exception("Instance recreation failed. Aborting operation.")
+                recreated_instances.extend(created_instances)
+
+            click.echo(click.style("Instances recreated successfully.", fg="green"))
+            for idx, instance in enumerate(recreated_instances):
+                click.echo(click.style(f"Instance {idx+1}: ID = {instance['InstanceId']}", fg="green"))
+
+            if check_bucket_exists(VERSION_BUCKET_NAME):
+                save_version_info_to_bucket(new_version_id, comment, recreated_instances)
+            else:
+                if click.confirm("Do you want to save the version information in a bucket?", default=False):
+                    create_version_bucket()
+                    save_version_info_to_bucket(new_version_id, comment, recreated_instances)
+                else:
+                    save_version_info_locally(new_version_id, comment, recreated_instances)
+        except Exception as e:
+            click.echo(click.style(f"Failed to recreate instances: {e}", fg="red"))
+    else:
+        click.echo(click.style("Instance recreation aborted.", fg="yellow"))
+
+
+
+#version
+
+def load_version_info(version_id):
+    key = load_key()
+    if os.path.exists(os.path.join(VERSION_DIR, f"{version_id}.enc")):
+        with open(os.path.join(VERSION_DIR, f"{version_id}.enc"), 'rb') as version_file:
+            encrypted_version_info = version_file.read()
+        decrypted_version_info = decrypt_data(encrypted_version_info, key)
+        return json.loads(decrypted_version_info)
+    else:
+        try:
+            credentials = load_aws_credentials()
+            s3 = boto3.client('s3', **credentials)
+            response = s3.get_object(Bucket=VERSION_BUCKET_NAME, Key=f"{version_id}.enc")
+            encrypted_version_info = response['Body'].read()
+            decrypted_version_info = decrypt_data(encrypted_version_info, key)
+            return json.loads(decrypted_version_info)
+        except ClientError as e:
+            click.echo(click.style(f"No version information found for ID {version_id}.", fg="red"))
+            return None
+
+def list_versions():
+    versions = []
+    key = load_key()
+    # Check local versions
+    for file_name in os.listdir(VERSION_DIR):
+        if file_name.endswith(".enc"):
+            version_id = file_name.split(".")[0]
+            version_info = load_version_info(version_id)
+            if version_info:
+                timestamp = datetime.fromtimestamp(os.path.getmtime(os.path.join(VERSION_DIR, f"{version_id}.enc"))).strftime('%Y-%m-%d %H:%M:%S')
+                instance_count = len(version_info['content'])
+                versions.append((version_id, version_info.get('comment', ''), timestamp, instance_count))
+    # Check S3 versions
+    credentials = load_aws_credentials()
+    s3 = boto3.client('s3', **credentials)
+    try:
+        response = s3.list_objects_v2(Bucket=VERSION_BUCKET_NAME)
+        for obj in response.get('Contents', []):
+            version_id = obj['Key'].split(".")[0]
+            version_info = load_version_info(version_id)
+            if version_info:
+                timestamp = obj['LastModified'].strftime('%Y-%m-%d %H:%M:%S')
+                instance_count = len(version_info['content'])
+                versions.append((version_id, version_info.get('comment', ''), timestamp, instance_count))
+    except ClientError as e:
+        click.echo(click.style(f"Error listing versions in S3: {e}", fg="red"))
+    return versions
+
+@click.command(name="view-version", help="View version information.")
+@click.option('-o', '--output', type=click.Choice(['table', 'wide']), default='table', help="Output format")
+def view_version(output):
+    versions = list_versions()
+    if output == 'table':
+        table = [[version_id, comment, timestamp, count] for version_id, comment, timestamp, count in versions]
+        headers = ["Version ID", "Comment", "Date", "Time", "Count"]
+        click.echo(tabulate(table, headers, tablefmt="grid"))
+    elif output == 'wide':
+        for version_id, comment, timestamp, count in versions:
+            version_info = load_version_info(version_id)
+            click.echo(click.style(f"Version ID: {version_id}", fg="green"))
+            click.echo(click.style(f"Comment: {comment}", fg="green"))
+            click.echo(click.style(f"Timestamp: {timestamp}", fg="green"))
+            click.echo(click.style(f"Count: {count}", fg="green"))
             click.echo(click.style(json.dumps(version_info['content'], indent=2), fg="green"))
-            click.echo('-' * 80)
+            click.echo("-" * 80)
+cli.add_command(view_version)
 
 if __name__ == '__main__':
     cli.add_command(configure_aws)
@@ -448,5 +576,7 @@ if __name__ == '__main__':
     cli.add_command(create_ec2_dob)
     cli.add_command(recreate_ec2)
     cli.add_command(view_version)
+    cli.add_command(delete_ec2)
     cli()
+
 
