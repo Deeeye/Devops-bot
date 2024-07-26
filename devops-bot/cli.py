@@ -710,6 +710,112 @@ def delete_bucket(bucket_name):
     else:
         click.echo(click.style("Bucket deletion aborted.", fg="yellow"))
 
+
+def fetch_instance_details(instance_ids, credentials):
+    ec2 = boto3.client('ec2', **credentials)
+    max_retries = 10
+    wait_time = 60
+
+    for _ in range(max_retries):
+        try:
+            response = ec2.describe_instances(InstanceIds=instance_ids)
+            all_running = True
+            for reservation in response['Reservations']:
+                for instance in reservation['Instances']:
+                    if instance['State']['Name'] != 'running':
+                        all_running = False
+                        break
+                if not all_running:
+                    break
+            if all_running:
+                return response['Reservations']
+            else:
+                time.sleep(wait_time)  # Wait before retrying
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'InvalidInstanceID.NotFound':
+                time.sleep(wait_time)  # Wait before retrying
+            else:
+                raise e
+    raise Exception(f"Instances {instance_ids} did not reach running state within the allotted time.")
+
+@cli.command(name="create-ec2-dob", help="Create EC2 instances using dob-screenplay YAML file.")
+@click.argument('dob_screenplay', type=click.Path(exists=True))
+def create_ec2_dob(dob_screenplay):
+    with open(dob_screenplay, 'r') as f:
+        dob_content = yaml.safe_load(f)
+
+    click.echo(click.style("\nStaging area: Creating and configuring EC2 instance(s) using dob-screenplay:", fg="green"))
+    for idx, resource in enumerate(dob_content['resources']['ec2_instances']):
+        table_data = [
+            [click.style("+", fg="green"), "Instance Type", resource['instance_type']],
+            [click.style("+", fg="green"), "AMI ID", resource['ami_id']],
+            [click.style("+", fg="green"), "Key Name", resource['key_name']],
+            [click.style("+", fg="green"), "Security Group", resource['security_group']],
+            [click.style("+", fg="green"), "Count", resource.get('count', 1)],
+            [click.style("+", fg="green"), "Tags", resource.get('tags', {})],
+            [click.style("+", fg="green"), "User Data", resource.get('user_data', '')]
+        ]
+        click.echo(tabulate(table_data, headers=["", "Attribute", "Value"], tablefmt="grid"))
+
+    if click.confirm(click.style("Do you want to proceed with creating and configuring the instance(s)?", fg="green"), default=True):
+        version_id = str(uuid.uuid4())  # Generate a unique version ID
+        comment = click.prompt(click.style("Enter a comment for this version", fg="green"))
+
+        try:
+            instances = []
+            credentials = load_aws_credentials()
+            for resource in dob_content['resources']['ec2_instances']:
+                instance_type = resource['instance_type']
+                ami_id = resource['ami_id']
+                key_name = resource['key_name']
+                security_group = resource['security_group']
+                count = resource.get('count', 1)
+                tags = resource.get('tags', {})
+                user_data = resource.get('user_data', '')
+
+                ec2 = boto3.client('ec2', **credentials)
+                response = ec2.run_instances(
+                    InstanceType=instance_type,
+                    ImageId=ami_id,
+                    KeyName=key_name,
+                    SecurityGroupIds=[security_group],
+                    MinCount=count,
+                    MaxCount=count,
+                    TagSpecifications=[{
+                        'ResourceType': 'instance',
+                        'Tags': [{'Key': k, 'Value': v} for k, v in tags.items()]
+                    }],
+                    UserData=user_data
+                )
+
+                instance_ids = [instance['InstanceId'] for instance in response['Instances']]
+                instances.extend(instance_ids)
+
+            click.echo(f"Instances created with IDs: {', '.join(instances)}")
+            click.echo("Waiting for instances to be in running state...")
+            reservations = fetch_instance_details(instance_ids, credentials)
+            click.echo("Instances are now running.")
+
+            for reservation in reservations:
+                for instance in reservation['Instances']:
+                    instance_id = instance['InstanceId']
+                    public_ip = instance.get('PublicIpAddress', 'No public IP')
+                    click.echo(f"Instance {instance_id} has Public IP: {public_ip}")
+
+            if check_bucket_exists(VERSION_BUCKET_NAME):
+                save_version_info_to_bucket(version_id, comment, reservations)
+            else:
+                if click.confirm("Do you want to save the version information in a bucket?", default=False):
+                    create_version_bucket()
+                    save_version_info_to_bucket(version_id, comment, reservations)
+                else:
+                    save_version_info_locally(version_id, comment, reservations)
+
+        except ClientError as e:
+            click.echo(click.style(f"Failed to create and configure instances: {e}", fg="red"))
+
+
+
 if __name__ == '__main__':
     cli.add_command(configure_aws)
     cli.add_command(login)
